@@ -13,13 +13,14 @@ from kobuki_msgs.msg import SensorState
 # control at 100Hz
 CONTROL_PERIOD = rospy.Duration(0.01)
 
-# wait for 1s between actions
+# wait time between actions
 WAIT_DURATION = rospy.Duration(0.5)
 
-ANGLE_RAMP_TIME = 2.0
-ANGLE_RAMP_SPEED = 1.5
-ANGLE_MIN_SPEED = 0.2
-ANGLE_GAIN = 3.0
+ANGULAR_TOL = 0.01 # rad (about 1/2 degree)
+ANGULAR_RAMP_TIME = 2.0 # s
+ANGULAR_RAMP_SPEED = 1.5 # rad/s
+ANGULAR_MIN_SPEED = 0.2 # rad/s
+ANGULAR_GAIN = 3.0 # rad/s per rad, so actually just 1/s
 
 # our controller class
 class Controller:
@@ -36,6 +37,9 @@ class Controller:
 
         # start out in waiting state
         self.reset_state('waiting')
+
+        # wait for the very first pose of the robot (so we can check at end)
+        self.very_first_pose = None
 
         # we always store the previous command from the control callback
         self.prev_vel = Twist()
@@ -84,15 +88,19 @@ class Controller:
     def compute_turn_vel(self, rel_pose, desired_angle, time):
 
         angle_error = desired_angle - rel_pose.theta
-        done = (abs(angle_error) < 0.01) # about 1/2 degree
+        done = (abs(angle_error) < ANGULAR_TOL)
 
         rospy.loginfo('angle_error={}'.format(angle_error))
 
-        angular_vel = ANGLE_GAIN * angle_error
-        angular_vel = numpy.sign(angular_vel)*max(abs(angular_vel), 
-                                                  ANGLE_MIN_SPEED)
+        angular_vel = ANGULAR_GAIN * angle_error
 
-        vmax = min(time, ANGLE_RAMP_TIME) * ANGLE_RAMP_SPEED/ANGLE_RAMP_TIME
+        sign = numpy.sign(angular_vel)
+        clamped_vel = max(abs(angular_vel), ANGULAR_MIN_SPEED)
+        
+        angular_vel = sign*clamped_vel
+
+        effective_time = min(time, ANGULAR_RAMP_TIME)
+        vmax = effective_time * ANGULAR_RAMP_SPEED/ANGULAR_RAMP_TIME
             
         angular_vel = numpy.clip(angular_vel, -vmax, vmax)
 
@@ -126,6 +134,7 @@ class Controller:
                 rospy.loginfo('waiting for start pose')
             else:
                 rospy.loginfo('ready!')
+                self.very_first_pose = cur_pose.copy()
                 self.reset_state('turnleft')
 
         elif self.state == 'waitleft':
@@ -135,7 +144,8 @@ class Controller:
 
         elif self.state == 'turnleft':
             
-            cmd_vel, done = self.compute_turn_vel(rel_pose, numpy.pi/2, state_duration.to_sec())
+            cmd_vel, done = self.compute_turn_vel(rel_pose, numpy.pi/2,
+                                                  state_duration.to_sec())
             
             if done:
                 self.reset_state('waitright')
@@ -147,7 +157,8 @@ class Controller:
                 
         elif self.state == 'turnright':
 
-            cmd_vel, done = self.compute_turn_vel(rel_pose, -numpy.pi/2, state_duration.to_sec())
+            cmd_vel, done = self.compute_turn_vel(rel_pose, -numpy.pi/2,
+                                                  state_duration.to_sec())
             
             if done:
                 self.reset_state('waitleft')
