@@ -5,6 +5,7 @@ import rospy
 import random
 import numpy
 import tf
+import transform2d
 
 from geometry_msgs.msg import Twist
 from kobuki_msgs.msg import SensorState
@@ -12,17 +13,13 @@ from kobuki_msgs.msg import SensorState
 # control at 100Hz
 CONTROL_PERIOD = rospy.Duration(0.01)
 
-# react to bumpers for 1 second
-BUMPER_DURATION = rospy.Duration(1.0)
+# wait for 1s between actions
+WAIT_DURATION = rospy.Duration(0.5)
 
-# radians per second squared
-MAX_ANGULAR_ACCEL = 1.0
-
-# meters per second squared
-MAX_LINEAR_ACCEL = 1.0
-
-# converts radians to radians per second
-ANGULAR_GAIN = 0.1
+ANGLE_RAMP_TIME = 2.0
+ANGLE_RAMP_SPEED = 1.5
+ANGLE_MIN_SPEED = 0.2
+ANGLE_GAIN = 3.0
 
 # our controller class
 class Controller:
@@ -38,10 +35,7 @@ class Controller:
                                            Twist)
 
         # start out in waiting state
-        self.state = 'waiting'
-
-        # no start pose yet
-        self.start_pose = None
+        self.reset_state('waiting')
 
         # we always store the previous command from the control callback
         self.prev_vel = Twist()
@@ -58,12 +52,18 @@ class Controller:
         # set up a TransformListener to get odometry information
         self.odom_listener = tf.TransformListener()
 
+    def reset_state(self, state):
+
+        self.state = state
+        self.start_pose = None
+        self.start_time = rospy.get_rostime()
+
     # called whenever sensor messages are received
     def sensor_callback(self, msg):
 
         if msg.cliff or msg.bumper:
             rospy.loginfo('quitting because picked up/bumped')
-            sys.exit(0)
+            rospy.signal_shutdown('safety stop')
 
     # get current pose from TransformListener and convert it into a transform2d
     def get_current_pose(self):
@@ -78,44 +78,29 @@ class Controller:
 
         xform2d = transform2d.transform2d_from_ros_transform(ros_xform)
 
-        if self.start_pose is None:
-            self.start_pose = xform2d.copy()
-
         return xform2d
 
-    # called to cap max change on velocities
-    def filter_cmd(self, cmd_vel):
-
-        dt = CONTROL_PERIOD.to_sec()
-        max_angular_vel_change = MAX_ANGULAR_ACCEL * dt
-        max_linear_vel_change = MAX_LINEAR_ACCEL * dt
-
-        angular_delta = numpy.clip(prev_vel.angular.z - cmd_vel.angular.z,
-                                   -max_angular_vel_change,
-                                   max_angular_vel_change)
-
-        linear_delta = numpy.clip(prev_vel.linear.x - cmd_vel.linear.x,
-                                  -max_linear_vel_change,
-                                  max_linear_vel_change)
-
-        filtered_vel = Twist()
-        filtered_vel.angular.z = prev_vel.angular.z + angular_delta
-        filtered_vel.linear.x = prev_vel.linear.x + linear_delta
-
-        return filtered_vel
-
     # called to figure angular speed
-    def compute_turn_vel(self, rel_pose, desired_angle):
-        
-        angle_error = transform2d.diff_angle_rad(rel_pose, desired_angle)
-        
+    def compute_turn_vel(self, rel_pose, desired_angle, time):
+
+        angle_error = desired_angle - rel_pose.theta
+        done = (abs(angle_error) < 0.01) # about 1/2 degree
+
+        rospy.loginfo('angle_error={}'.format(angle_error))
+
+        angular_vel = ANGLE_GAIN * angle_error
+        angular_vel = numpy.sign(angular_vel)*max(abs(angular_vel), 
+                                                  ANGLE_MIN_SPEED)
+
+        vmax = min(time, ANGLE_RAMP_TIME) * ANGLE_RAMP_SPEED/ANGLE_RAMP_TIME
+            
+        angular_vel = numpy.clip(angular_vel, -vmax, vmax)
+
         cmd_vel = Twist()
-        
-        cmd_vel.angular.z = ANGULAR_GAIN*angle_error
 
-        done = (angle_error < 0.001)
+        cmd_vel.angular.z = angular_vel
 
-        return self.filter_cmd(cmd_vel), done
+        return cmd_vel, done
             
     # called 100 times per second
     def control_callback(self, timer_event=None):
@@ -124,34 +109,48 @@ class Controller:
         cmd_vel = Twist()
 
         cur_pose = self.get_current_pose()
-        if cur_pose is not None:
-            rel_pose = self.start_pose.inverse() * cur_pose
 
+        if cur_pose is not None:
+            if self.start_pose is None:
+                self.start_pose = cur_pose.copy()
+            rel_pose = self.start_pose.inverse() * cur_pose
+            rospy.loginfo('rel_pose: {}'.format(rel_pose))
+        else:
+            rel_pose = None
+
+        state_duration = rospy.get_rostime() - self.start_time
+            
         if self.state == 'waiting':
             
-            if self.start_pose is None:
+            if cur_pose is None:
                 rospy.loginfo('waiting for start pose')
             else:
                 rospy.loginfo('ready!')
-                self.state = 'turnleft'
+                self.reset_state('turnleft')
+
+        elif self.state == 'waitleft':
+
+            if state_duration > WAIT_DURATION:
+                self.reset_state('turnleft')
 
         elif self.state == 'turnleft':
             
-            cmd_vel, done = self.compute_turn_vel(rel_pose, math.pi/2)
+            cmd_vel, done = self.compute_turn_vel(rel_pose, numpy.pi/2, state_duration.to_sec())
             
             if done:
-                self.start_pose = cur_pose
-                self.state = 'turnright'
-                rospy.loginfo('entering state' + self.state)
+                self.reset_state('waitright')
+
+        elif self.state == 'waitright':
+
+            if state_duration > WAIT_DURATION:
+                self.reset_state('turnright')
                 
         elif self.state == 'turnright':
 
-            cmd_vel, done = self.compute_turn_vel(rel_pose, -math.pi/2)
+            cmd_vel, done = self.compute_turn_vel(rel_pose, -numpy.pi/2, state_duration.to_sec())
             
             if done:
-                self.start_pose = cur_pose
-                self.state = 'turnleft'
-                rospy.loginfo('entering state' + self.state)
+                self.reset_state('waitleft')
             
         self.cmd_vel_pub.publish(cmd_vel)
         self.prev_vel = cmd_vel
