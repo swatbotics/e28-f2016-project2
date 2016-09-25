@@ -42,9 +42,6 @@ class Controller:
         # no start pose yet
         self.start_pose = None
 
-        # pick out a random action to do when we start driving
-        self.pick_random_action()
-
         # we always store the previous command from the control callback
         self.prev_vel = Twist()
 
