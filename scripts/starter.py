@@ -4,6 +4,7 @@ import roslib; roslib.load_manifest('project2')
 import rospy
 import random
 import numpy
+import tf
 
 from geometry_msgs.msg import Twist
 from kobuki_msgs.msg import SensorState
